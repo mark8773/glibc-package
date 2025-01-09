@@ -1,32 +1,66 @@
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 199d7478fd3..fc011650926 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2112,10 +2112,10 @@ tu_upload_shader(struct tu_device *dev,
+       size += vpc_size;
+    }
+ 
+-   pthread_mutex_lock(&dev->pipeline_mutex);
++   mtx_lock(&dev->pipeline_mutex);
+    VkResult result = tu_suballoc_bo_alloc(&shader->bo, &dev->pipeline_suballoc,
+                                           size * 4, 128);
+-   pthread_mutex_unlock(&dev->pipeline_mutex);
++   mtx_unlock(&dev->pipeline_mutex);
+ 
+    if (result != VK_SUCCESS)
+       return result;
+@@ -2145,9 +2145,9 @@ tu_upload_shader(struct tu_device *dev,
+ 
+    result = tu_setup_pvtmem(dev, shader, &pvtmem_config, pvtmem_size, per_wave);
+    if (result != VK_SUCCESS) {
+-      pthread_mutex_lock(&dev->pipeline_mutex);
++      mtx_lock(&dev->pipeline_mutex);
+       tu_suballoc_bo_free(&dev->pipeline_suballoc, &shader->bo);
+-      pthread_mutex_unlock(&dev->pipeline_mutex);
++      mtx_unlock(&dev->pipeline_mutex);
+       return result;
+    }
+ 
+@@ -2855,10 +2855,10 @@ tu_empty_shader_create(struct tu_device *dev,
+    if (!shader)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+-   pthread_mutex_lock(&dev->pipeline_mutex);
++   mtx_lock(&dev->pipeline_mutex);
+    VkResult result = tu_suballoc_bo_alloc(&shader->bo, &dev->pipeline_suballoc,
+                                           32 * 4, 128);
+-   pthread_mutex_unlock(&dev->pipeline_mutex);
++   mtx_unlock(&dev->pipeline_mutex);
+ 
+    if (result != VK_SUCCESS) {
+       vk_free(&dev->vk.alloc, shader);
+@@ -2970,9 +2970,9 @@ tu_shader_destroy(struct tu_device *dev,
+    tu_cs_finish(&shader->cs);
+    TU_RMV(resource_destroy, dev, &shader->bo);
+ 
+-   pthread_mutex_lock(&dev->pipeline_mutex);
++   mtx_lock(&dev->pipeline_mutex);
+    tu_suballoc_bo_free(&dev->pipeline_suballoc, &shader->bo);
+-   pthread_mutex_unlock(&dev->pipeline_mutex);
++   mtx_unlock(&dev->pipeline_mutex);
+ 
+    if (shader->pvtmem_bo)
+       tu_bo_finish(dev, shader->pvtmem_bo);
 diff --git a/src/freedreno/vulkan/tu_wsi.cc b/src/freedreno/vulkan/tu_wsi.cc
-index 9929993bbe0..85c744585a8 100644
+index 57cf9048b07..4b397e741cf 100644
 --- a/src/freedreno/vulkan/tu_wsi.cc
 +++ b/src/freedreno/vulkan/tu_wsi.cc
-@@ -14,6 +14,18 @@
- 
- #include "tu_device.h"
- 
-+static void
-+kgsl_get_info(VkPhysicalDevice _pdevice,
-+                       VkDeviceMemory _memory,
-+                       int *fd,
-+                       uint32_t *offset)
-+{
-+   VK_FROM_HANDLE(tu_physical_device, pdevice, _pdevice);
-+   VK_FROM_HANDLE(tu_device_memory, memory, _memory);
-+   *fd = pdevice->local_fd;
-+   *offset = memory->bo->gem_handle << 12;
-+}
-+
- static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
- tu_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
- {
-@@ -45,6 +57,11 @@ tu_wsi_init(struct tu_physical_device *physical_device)
+@@ -48,6 +48,10 @@ tu_wsi_init(struct tu_physical_device *physical_device)
     if (result != VK_SUCCESS)
        return result;
  
 +   if (strcmp(physical_device->instance->knl->name, "kgsl") == 0) {
-+      physical_device->wsi_device.kgsl_get_info = kgsl_get_info;
 +      physical_device->wsi_device.is_tu_kgsl = true;
 +   }
 +
@@ -34,23 +68,32 @@ index 9929993bbe0..85c744585a8 100644
     physical_device->wsi_device.can_present_on_device =
        tu_wsi_can_present_on_device;
 diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
-index 726862560e8..3539a585d22 100644
+index cd63a008c05..c40344449dd 100644
 --- a/src/vulkan/wsi/wsi_common.c
 +++ b/src/vulkan/wsi/wsi_common.c
-@@ -1424,7 +1424,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
-       assert(!has_signal_dma_buf);
+@@ -1552,7 +1552,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
  #endif
+       }
  
 -      if (wsi->sw)
 +      if (wsi->sw || (wsi->is_tu_kgsl && !has_signal_dma_buf))
  	      wsi->WaitForFences(device, 1, &swapchain->fences[image_index],
  				 true, ~0ull);
  
+@@ -2190,7 +2190,7 @@ wsi_configure_cpu_image(const struct wsi_swapchain *chain,
+                         const struct wsi_cpu_image_params *params,
+                         struct wsi_image_info *info)
+ {
+-   assert(params->base.image_type == WSI_IMAGE_TYPE_CPU);
++   //assert(params->base.image_type == WSI_IMAGE_TYPE_CPU);
+    assert(chain->blit.type == WSI_SWAPCHAIN_NO_BLIT ||
+           chain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT);
+ 
 diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
-index 346025602b9..fbf22a736c1 100644
+index eebf519e6bc..805d427617e 100644
 --- a/src/vulkan/wsi/wsi_common.h
 +++ b/src/vulkan/wsi/wsi_common.h
-@@ -168,6 +168,7 @@ struct wsi_device {
+@@ -178,6 +178,7 @@ struct wsi_device {
     } win32;
  
     bool sw;
@@ -58,226 +101,185 @@ index 346025602b9..fbf22a736c1 100644
  
     /* Set to true if the implementation is ok with linear WSI images. */
     bool wants_linear;
-@@ -221,6 +222,11 @@ struct wsi_device {
-     */
-    VkQueue (*get_blit_queue)(VkDevice device);
+diff --git a/src/vulkan/wsi/wsi_common_display.c b/src/vulkan/wsi/wsi_common_display.c
+index ff57a259046..dff8ae077a6 100644
+--- a/src/vulkan/wsi/wsi_common_display.c
++++ b/src/vulkan/wsi/wsi_common_display.c
+@@ -176,6 +176,12 @@ struct wsi_display_sync {
  
-+   void (*kgsl_get_info)(VkPhysicalDevice _pdevice,
-+                          VkDeviceMemory _memory,
-+                          int *fd,
-+                          uint32_t *offset);
+ static uint64_t fence_sequence;
+ 
++#ifdef __linux__
++static void thread_signal_handler (int signum) {
++   pthread_exit (0);
++}
++#endif
 +
- #define WSI_CB(cb) PFN_vk##cb cb
-    WSI_CB(AllocateMemory);
-    WSI_CB(AllocateCommandBuffers);
+ ICD_DEFINE_NONDISP_HANDLE_CASTS(wsi_display_mode, VkDisplayModeKHR)
+ ICD_DEFINE_NONDISP_HANDLE_CASTS(wsi_display_connector, VkDisplayKHR)
+ 
+@@ -1341,7 +1347,9 @@ wsi_display_wait_thread(void *data)
+       .events = POLLIN
+    };
+ 
++#ifndef __linux__
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
++#endif
+    for (;;) {
+       int ret = poll(&pollfd, 1, -1);
+       if (ret > 0) {
+@@ -1369,9 +1377,22 @@ wsi_display_start_wait_thread(struct wsi_display *wsi)
+ static void
+ wsi_display_stop_wait_thread(struct wsi_display *wsi)
+ {
++#ifdef __linux__
++   struct sigaction actions;
++   memset (&actions, 0, sizeof (actions));
++   sigemptyset (&actions.sa_mask);
++   actions.sa_flags = 0;
++   actions.sa_handler = thread_signal_handler;
++   sigaction (SIGUSR2, &actions, NULL);
++#endif
++
+    mtx_lock(&wsi->wait_mutex);
+    if (wsi->wait_thread) {
++#ifndef __linux__
+       pthread_cancel(wsi->wait_thread);
++#else
++      pthread_kill(wsi->wait_thread, SIGUSR2);
++#endif
+       pthread_join(wsi->wait_thread, NULL);
+       wsi->wait_thread = 0;
+    }
+@@ -2215,7 +2236,9 @@ udev_event_listener_thread(void *data)
+ 
+    int udev_fd = udev_monitor_get_fd(mon);
+ 
++#ifndef __linux__
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
++#endif
+ 
+    for (;;) {
+       nfds_t nfds = 1;
+@@ -2340,6 +2363,15 @@ wsi_display_finish_wsi(struct wsi_device *wsi_device,
+    struct wsi_display *wsi =
+       (struct wsi_display *) wsi_device->wsi[VK_ICD_WSI_PLATFORM_DISPLAY];
+ 
++#ifdef __linux__
++   struct sigaction actions;
++   memset (&actions, 0, sizeof (actions));
++   sigemptyset (&actions.sa_mask);
++   actions.sa_flags = 0;
++   actions.sa_handler = thread_signal_handler;
++   sigaction (SIGUSR2, &actions, NULL);
++#endif
++
+    if (wsi) {
+       wsi_for_each_connector(connector, wsi) {
+          wsi_for_each_display_mode(mode, connector) {
+@@ -2351,7 +2383,11 @@ wsi_display_finish_wsi(struct wsi_device *wsi_device,
+       wsi_display_stop_wait_thread(wsi);
+ 
+       if (wsi->hotplug_thread) {
++#ifndef __linux__
+          pthread_cancel(wsi->hotplug_thread);
++#else
++         pthread_kill(wsi->hotplug_thread, SIGUSR2);
++#endif
+          pthread_join(wsi->hotplug_thread, NULL);
+       }
+ 
 diff --git a/src/vulkan/wsi/wsi_common_drm.c b/src/vulkan/wsi/wsi_common_drm.c
-index b53d485ef3a..da6afac2376 100644
+index 9835f8f990b..ba73f679cf9 100644
 --- a/src/vulkan/wsi/wsi_common_drm.c
 +++ b/src/vulkan/wsi/wsi_common_drm.c
-@@ -39,6 +39,10 @@
- #include <stdlib.h>
- #include <stdio.h>
- #include <xf86drm.h>
-+#include <fcntl.h>
-+#include <sys/ioctl.h>
-+#include <sys/mman.h>
-+#include <linux/dma-heap.h>
- 
+@@ -45,6 +45,9 @@
  static VkResult
  wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
-@@ -54,7 +58,7 @@ wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
-    };
-    int ret = drmIoctl(dma_buf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export);
-    if (ret) {
--      if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
-+      if (errno == ENOTTY || errno == EBADF || errno == ENOSYS || errno == ENODEV) {
-          no_dma_buf_sync_file = true;
-          return VK_ERROR_FEATURE_NOT_PRESENT;
-       } else {
-@@ -82,7 +86,7 @@ wsi_dma_buf_import_sync_file(int dma_buf_fd, int sync_file_fd)
-    };
-    int ret = drmIoctl(dma_buf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);
-    if (ret) {
--      if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
-+      if (errno == ENOTTY || errno == EBADF || errno == ENOSYS || errno == ENODEV) {
-          no_dma_buf_sync_file = true;
-          return VK_ERROR_FEATURE_NOT_PRESENT;
-       } else {
-@@ -306,6 +310,11 @@ wsi_create_native_image_mem(const struct wsi_swapchain *chain,
-                             const struct wsi_image_info *info,
-                             struct wsi_image *image);
- 
-+static VkResult
-+wsi_create_kgsl_image_mem(const struct wsi_swapchain *chain,
-+                            const struct wsi_image_info *info,
-+                            struct wsi_image *image);
-+
- static VkResult
- wsi_configure_native_image(const struct wsi_swapchain *chain,
-                            const VkSwapchainCreateInfoKHR *pCreateInfo,
-@@ -444,7 +453,10 @@ wsi_configure_native_image(const struct wsi_swapchain *chain,
-       }
-    }
- 
--   info->create_mem = wsi_create_native_image_mem;
-+   if (wsi->is_tu_kgsl)
-+      info->create_mem = wsi_create_kgsl_image_mem;
-+   else
-+      info->create_mem = wsi_create_native_image_mem;
+ {
++   #if defined (__linux__)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   #else
+    /* Don't keep trying an IOCTL that doesn't exist. */
+    static bool no_dma_buf_sync_file = false;
+    if (no_dma_buf_sync_file)
+@@ -68,11 +71,15 @@ wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
+    *sync_file_fd = export.fd;
  
     return VK_SUCCESS;
- 
-@@ -563,6 +575,124 @@ wsi_create_native_image_mem(const struct wsi_swapchain *chain,
-    return VK_SUCCESS;
++   #endif
  }
  
-+static int
-+dma_heap_alloc(uint64_t size)
-+{
-+   int fd = -1, heap = open("/dev/dma_heap/system", O_RDONLY);
-+   if (heap < 0)
-+      goto fail_open;
-+   struct dma_heap_allocation_data alloc_data = {.len = size, .fd_flags = O_RDWR | O_CLOEXEC};
-+   if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &alloc_data) < 0)
-+      goto fail_alloc;
-+   fd = alloc_data.fd;
-+fail_alloc:
-+   close(heap);
-+fail_open:
-+   return fd;
-+}
-+
-+static int ion_alloc(uint64_t size) {
-+   int fd = -1, ion_dev = open("/dev/ion", O_RDONLY);
-+   if (ion_dev < 0)
-+      goto fail_open;
-+   struct ion_allocation_data {
-+      __u64 len;
-+      __u32 heap_id_mask;
-+      __u32 flags;
-+      __u32 fd;
-+      __u32 unused;
-+   } alloc_data = {
-+       .len = size,
-+       /* ION_HEAP_SYSTEM | ION_SYSTEM_HEAP_ID */
-+       .heap_id_mask = (1U << 0) | (1U << 25),
-+       .flags = 0, /* uncached */
-+   };
-+   if (ioctl(ion_dev, _IOWR('I', 0, struct ion_allocation_data), &alloc_data) <
-+       0)
-+      goto fail_alloc;
-+   fd = alloc_data.fd;
-+fail_alloc:
-+   close(ion_dev);
-+fail_open:
-+   return fd;
-+};
-+
-+static VkResult
-+wsi_create_kgsl_image_mem(const struct wsi_swapchain *chain,
-+                            const struct wsi_image_info *info,
-+                            struct wsi_image *image)
-+{
-+   const struct wsi_device *wsi = chain->wsi;
-+   VkResult result;
-+
-+   VkMemoryRequirements reqs;
-+   wsi->GetImageMemoryRequirements(chain->device, image->image, &reqs);
-+
-+   if (debug_get_bool_option("USE_HEAP", true)) {
-+      image->dma_buf_fd = dma_heap_alloc(reqs.size);
-+      if (image->dma_buf_fd < 0)
-+         image->dma_buf_fd = ion_alloc(reqs.size);
-+   }
-+
-+   const struct wsi_memory_allocate_info memory_wsi_info = {
-+      .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
-+      .pNext = NULL,
-+      .implicit_sync = true,
-+   };
-+   const VkImportMemoryFdInfoKHR memory_import_info = {
-+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-+      .pNext = &memory_wsi_info,
-+      .fd = os_dupfd_cloexec(image->dma_buf_fd),
-+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
-+   };
-+   const VkMemoryDedicatedAllocateInfo memory_dedicated_info = {
-+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-+      .pNext = (image->dma_buf_fd < 0) ? (void*)&memory_wsi_info : (void*)&memory_import_info,
-+      .image = image->image,
-+      .buffer = VK_NULL_HANDLE,
-+   };
-+   const VkMemoryAllocateInfo memory_info = {
-+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-+      .pNext = &memory_dedicated_info,
-+      .allocationSize = reqs.size,
-+      .memoryTypeIndex =
-+         wsi_select_device_memory_type(wsi, reqs.memoryTypeBits),
-+   };
-+   result = wsi->AllocateMemory(chain->device, &memory_info,
-+                                &chain->alloc, &image->memory);
-+   if (result != VK_SUCCESS)
-+      return result;
-+
-+   uint32_t dma_buf_offset = 0;
-+   if (image->dma_buf_fd == -1)
-+      wsi->kgsl_get_info(wsi->pdevice, image->memory, &image->dma_buf_fd,
-+                 &dma_buf_offset);
-+
-+   image->cpu_map = mmap(0, reqs.size, PROT_READ | PROT_WRITE, MAP_SHARED,
-+                             image->dma_buf_fd, dma_buf_offset);
-+
-+   if (image->cpu_map == MAP_FAILED)
-+      return VK_ERROR_OUT_OF_HOST_MEMORY;
-+   munmap(image->cpu_map, reqs.size);
-+
-+   const VkImageSubresource image_subresource = {
-+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-+      .mipLevel = 0,
-+      .arrayLayer = 0,
-+   };
-+   VkSubresourceLayout image_layout;
-+   wsi->GetImageSubresourceLayout(chain->device, image->image,
-+                                  &image_subresource, &image_layout);
-+
-+   image->drm_modifier = 1274; /* termux-x11's RAW_MMAPPABLE_FD */
-+   image->num_planes = 1;
-+   image->sizes[0] = reqs.size;
-+   image->row_pitches[0] = image_layout.rowPitch;
-+   image->offsets[0] = dma_buf_offset;
-+
-+   return VK_SUCCESS;
-+}
-+
- #define WSI_PRIME_LINEAR_STRIDE_ALIGN 256
+ static VkResult
+ wsi_dma_buf_import_sync_file(int dma_buf_fd, int sync_file_fd)
+ {
++   #if defined (__linux__)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   #else
+    /* Don't keep trying an IOCTL that doesn't exist. */
+    static bool no_dma_buf_sync_file = false;
+    if (no_dma_buf_sync_file)
+@@ -94,6 +101,7 @@ wsi_dma_buf_import_sync_file(int dma_buf_fd, int sync_file_fd)
+    }
+ 
+    return VK_SUCCESS;
++   #endif
+ }
  
  static VkResult
 diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
-index 2dff27afa64..1ba21660bab 100644
+index 03980b8d583..66e82988a47 100644
 --- a/src/vulkan/wsi/wsi_common_x11.c
 +++ b/src/vulkan/wsi/wsi_common_x11.c
-@@ -1617,7 +1617,7 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
-       options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
+@@ -148,22 +148,7 @@ static bool
+ wsi_x11_check_dri3_compatible(const struct wsi_device *wsi_dev,
+                               xcb_connection_t *conn)
+ {
+-   xcb_screen_iterator_t screen_iter =
+-      xcb_setup_roots_iterator(xcb_get_setup(conn));
+-   xcb_screen_t *screen = screen_iter.data;
+-
+-   /* Open the DRI3 device from the X server. If we do not retrieve one we
+-    * assume our local device is compatible.
+-    */
+-   int dri3_fd = wsi_dri3_open(conn, screen->root, None);
+-   if (dri3_fd == -1)
+-      return true;
+-
+-   bool match = wsi_dev->can_present_on_device(wsi_dev->pdevice, dri3_fd);
+-
+-   close(dri3_fd);
+-
+-   return match;
++   return true;
+ }
  #endif
  
--   xshmfence_reset(image->shm_fence);
-+   xcb_sync_reset_fence(chain->conn, image->sync_fence);
+@@ -1402,7 +1387,6 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
+    if (chain->has_dri3_modifiers)
+       options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
  
-    ++chain->sent_image_count;
-    assert(chain->sent_image_count <= chain->base.image_count);
-@@ -1749,7 +1749,7 @@ x11_acquire_next_image(struct wsi_swapchain *anv_chain,
+-   xshmfence_reset(image->shm_fence);
+ 
+    if (!chain->base.image_info.explicit_sync) {
+       ++chain->sent_image_count;
+@@ -1775,11 +1759,6 @@ x11_acquire_next_image(struct wsi_swapchain *anv_chain,
+       return result;
+ 
     assert(*image_index < chain->base.image_count);
-    if (chain->images[*image_index].shm_fence &&
-        !chain->base.image_info.explicit_sync)
+-#ifdef HAVE_X11_DRM
+-   if (chain->images[*image_index].shm_fence &&
+-       !chain->base.image_info.explicit_sync)
 -      xshmfence_await(chain->images[*image_index].shm_fence);
-+      xcb_sync_await_fence(chain->conn, 1, &chain->images[*image_index].sync_fence);
-
+-#endif
+ 
     return result;
  }
-@@ -2185,14 +2185,23 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+@@ -2142,15 +2121,24 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+       if (fd == -1)
           return VK_ERROR_OUT_OF_HOST_MEMORY;
  
-       cookie =
+-      cookie =
 -         xcb_dri3_pixmap_from_buffer_checked(chain->conn,
 -                                             image->pixmap,
 -                                             chain->window,
@@ -286,43 +288,47 @@ index 2dff27afa64..1ba21660bab 100644
 -                                             pCreateInfo->imageExtent.height,
 -                                             image->base.row_pitches[0],
 -                                             chain->depth, bpp, fd);
-+         xcb_dri3_pixmap_from_buffers_checked(chain->conn,
-+                                              image->pixmap,
-+                                              chain->window,
-+                                              1,
-+                                              pCreateInfo->imageExtent.width,
-+                                              pCreateInfo->imageExtent.height,
-+                                              image->base.row_pitches[0],
-+                                              image->base.offsets[0],
-+                                              0,
-+                                              0,
-+                                              0,
-+                                              0,
-+                                              0,
-+                                              0,
-+                                              chain->depth, bpp,
-+                                              image->base.drm_modifier,
-+                                              &fd);
++      cookie = xcb_dri3_pixmap_from_buffers_checked(chain->conn,
++                                                    image->pixmap,
++                                                    chain->window,
++                                                    image->base.num_planes,
++                                                    pCreateInfo->imageExtent.width,
++                                                    pCreateInfo->imageExtent.height,
++                                                    image->base.row_pitches[0],
++                                                    image->base.offsets[0],
++                                                    0,
++                                                    0,
++                                                    0,
++                                                    0,
++                                                    0,
++                                                    0,
++                                                    chain->depth,
++                                                    bpp,
++                                                    1274,
++                                                    &fd);
     }
  
     error = xcb_request_check(chain->conn, cookie);
-@@ -2201,6 +2210,11 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
-       goto fail_image;
+@@ -2180,6 +2168,9 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
     }
+ #endif
  
-+   image->sync_fence = xcb_generate_id(chain->conn);
-+   xcb_sync_create_fence(chain->conn, image->pixmap, image->sync_fence, false);
-+   xcb_sync_trigger_fence(chain->conn, image->sync_fence);
++   image->sync_fence = 0;
 +   return VK_SUCCESS;
 +
  out_fence:
     fence_fd = xshmfence_alloc_shm();
     if (fence_fd < 0)
-@@ -2245,7 +2260,6 @@ x11_image_finish(struct x11_swapchain *chain,
+@@ -2222,12 +2213,6 @@ x11_image_finish(struct x11_swapchain *chain,
+ {
+    xcb_void_cookie_t cookie;
     if (!chain->base.wsi->sw || chain->has_mit_shm) {
-       cookie = xcb_sync_destroy_fence(chain->conn, image->sync_fence);
-       xcb_discard_reply(chain->conn, cookie.sequence);
+-#ifdef HAVE_X11_DRM
+-      cookie = xcb_sync_destroy_fence(chain->conn, image->sync_fence);
+-      xcb_discard_reply(chain->conn, cookie.sequence);
 -      xshmfence_unmap_shm(image->shm_fence);
- 
+-#endif
+-
        cookie = xcb_free_pixmap(chain->conn, image->pixmap);
        xcb_discard_reply(chain->conn, cookie.sequence);
+ #ifdef HAVE_X11_DRM
